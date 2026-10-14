@@ -1,10 +1,12 @@
 -- The acceptor is a C-ABI shim over the eventchain libraries. It implements
--- nothing of the protocol itself: signing comes from eventchain-crypto, pinned
--- to a commit of the public repository so a build is reproducible.
+-- nothing of the protocol itself: the per-line checks come from
+-- eventchain-verify and signing from eventchain-crypto, pinned to a commit of
+-- the public repository so a build is reproducible. The conformance test
+-- reads the vectors out of that checkout under dist-newstyle/src/.
 packages: .
 
 source-repository-package
     type: git
     location: https://github.com/eventchain-protocol/eventchain.git
-    tag: 7bd243e0c7f29e03b708bb5231eb2b7498c31adb
-    subdir: eventchain-crypto
+    tag: 55b38b5a9986f1e19b00aba352267b324c9604de
+    subdir: eventchain-crypto eventchain-verify

@@ -15,14 +15,16 @@ files.
 
 ## Status
 
-What exists today is a spike that proves the Rust-to-Haskell seam end to end.
-It is a web server that signs whatever JSON is posted to `/` with the
-eventchain signing library, called through a C ABI.
+The acceptor is built: a Haskell shared library that judges one line as the
+eventchain verifier would, loads the Hub key and signs, behind a C ABI. Its
+conformance test runs every committed eventchain vector through the exported
+C functions and checks each verdict against the verifier's. The Hub itself is
+still a spike: a web server that signs whatever JSON is posted to `/`.
 
 | Milestone | State |
 | --- | --- |
 | Rust-to-Haskell seam (C ABI, runtime lifecycle, signing) | Spike working |
-| 1. Acceptor: per-line verification through the C ABI, conformance test | Not started |
+| 1. Acceptor: per-line verification through the C ABI, conformance test | Done |
 | 2. Append: writer thread, durability, crash recovery, receipts and refusals | Not started |
 | 3. Distribute and heartbeat: head, extension, whole file, lookup, heartbeats | Not started |
 | 4. Payloads and webhooks: blob store behind an access policy, subscriptions | Not started |
@@ -51,6 +53,13 @@ missing or built more than once.
 ```sh
 (cd acceptor && cabal build)
 cargo build --release
+```
+
+The acceptor's conformance test reads the vectors from the eventchain
+checkout cabal makes under `acceptor/dist-newstyle/src/`:
+
+```sh
+(cd acceptor && cabal test)
 ```
 
 ## Usage
@@ -82,13 +91,16 @@ the compressed public key, both base64url without padding:
 ```
 
 A body that is not JSON gets `400 Bad Request`. A key outside the P-256 scalar
-range gets `500 Internal Server Error`.
+range stops the Hub at startup.
 
 ## Repository layout
 
 ```
-acceptor/      Haskell Cabal project: a C-ABI shared library over the eventchain libraries
+acceptor/      Haskell Cabal project over the eventchain libraries
+  src/         the acceptor: one line judged by the verifier, verdicts coded for the ABI
+  ffi/         the C-ABI shared library's exports; marshalling only
   include/     the C header; the ABI contract between the two languages
+  tests/       the conformance test: every eventchain vector through the C ABI
 src/
   main.rs      the spike web server
   acceptor.rs  safe Rust wrapper over the C ABI and the GHC runtime lifecycle

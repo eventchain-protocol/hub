@@ -7,19 +7,50 @@ license-file:       LICENSE
 build-type:         Simple
 tested-with:        GHC ==9.12.4
 
--- One shared library. The Hub, written in Rust, loads it and calls the
--- functions declared in include/eventchain_acceptor.h. Nothing but bytes and
--- status codes cross that boundary.
-foreign-library eventchain_acceptor
-    type:               native-shared
-    hs-source-dirs:     src
-    other-modules:      EventChain.Acceptor.FFI
-    c-sources:          cbits/rts.c
-    include-dirs:       include
-    install-includes:   eventchain_acceptor.h
+common shared
     default-language:   GHC2024
-    ghc-options:        -Wall -threaded
+    ghc-options:        -Wall -Werror=incomplete-patterns
     build-depends:
         , base              >=4.20 && <5
         , bytestring        >=0.12 && <0.14
         , eventchain-crypto
+
+-- The judging logic and the verdict codes. A library of its own so that the
+-- conformance test and the shared library below are built on the same code.
+library
+    import:             shared
+    hs-source-dirs:     src
+    exposed-modules:    EventChain.Acceptor
+    build-depends:
+        , eventchain-verify
+
+-- One shared library. The Hub, written in Rust, loads it and calls the
+-- functions declared in include/eventchain_acceptor.h. Nothing but bytes and
+-- status codes cross that boundary.
+foreign-library eventchain_acceptor
+    import:             shared
+    type:               native-shared
+    hs-source-dirs:     ffi
+    other-modules:      EventChain.Acceptor.FFI
+    c-sources:          cbits/rts.c
+    include-dirs:       include
+    install-includes:   eventchain_acceptor.h
+    ghc-options:        -threaded
+    build-depends:
+        , eventchain-acceptor
+
+-- Every committed eventchain vector, one line at a time through the exported
+-- C functions, each verdict compared with the one the Verifier gives for the
+-- whole file. The FFI module is compiled in so that the test calls the real
+-- exports, not the Haskell behind them.
+test-suite conformance
+    import:             shared
+    type:               exitcode-stdio-1.0
+    hs-source-dirs:     tests ffi
+    main-is:            Conformance.hs
+    other-modules:      EventChain.Acceptor.FFI
+    build-depends:
+        , directory         >=1.3  && <1.4
+        , eventchain-acceptor
+        , eventchain-verify
+        , filepath          >=1.5  && <1.6

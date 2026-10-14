@@ -21,16 +21,15 @@ fn key_from_env() -> acceptor::Key {
         .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("HUB_KEY must be hex"))
         .collect();
     let bytes: [u8; 32] = bytes.try_into().expect("HUB_KEY must be 32 bytes");
-    acceptor::Key::from_bytes(bytes)
+    acceptor::Key::load(bytes).unwrap_or_else(|e| panic!("HUB_KEY is not a P-256 private scalar: {e:?}"))
 }
 
 async fn sign(State(app): State<Arc<App>>, body: Bytes) -> Result<Json<Value>, (StatusCode, String)> {
     serde_json::from_slice::<Value>(&body).map_err(|e| (StatusCode::BAD_REQUEST, format!("body is not JSON: {e}")))?;
     let signature = app.key.sign(&body).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:?}")))?;
-    let public_key = app.key.public_key().map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:?}")))?;
     Ok(Json(json!({
         "signature": URL_SAFE_NO_PAD.encode(signature),
-        "public_key": URL_SAFE_NO_PAD.encode(public_key),
+        "public_key": URL_SAFE_NO_PAD.encode(app.key.public_key()),
     })))
 }
 
