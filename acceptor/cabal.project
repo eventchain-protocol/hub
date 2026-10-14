@@ -1,0 +1,10 @@
+-- The acceptor is a C-ABI shim over the eventchain libraries. It implements
+-- nothing of the protocol itself: signing comes from eventchain-crypto, pinned
+-- to a commit of the public repository so a build is reproducible.
+packages: .
+
+source-repository-package
+    type: git
+    location: https://github.com/eventchain-protocol/eventchain.git
+    tag: 7bd243e0c7f29e03b708bb5231eb2b7498c31adb
+    subdir: eventchain-crypto
