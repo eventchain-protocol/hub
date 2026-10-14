@@ -94,8 +94,8 @@ that the structure, not a lock discipline:
 HTTP handler ──submission──▶ topic writer thread ──receipt/refusal──▶ handler
                                    │
                         owns: AOF file handle, head (count, hash)
-                        does: compare head, call acceptor once per line,
-                              append the submission, fsync,
+                        does: call acceptor once per line, the first
+                              against the head; append the submission; fsync;
                               write head sidecar, index Event IDs
 ```
 
@@ -104,8 +104,9 @@ line before it writes any, and writes all or none. The handler is async;
 the writer is a plain OS thread that blocks on the acceptor calls (about
 50 µs each) and the fsync. Submissions arrive over a bounded
 channel, so back-pressure reaches the HTTP layer as a 503 rather than an
-unbounded queue. The compare-and-swap on the expected head happens on the
-writer thread, where there is nothing to race.
+unbounded queue. The compare-and-swap on the head is the acceptor's chain
+check on the first line, run on the writer thread, where there is nothing
+to race.
 
 **Limit.** A thread per topic is right for tens to low thousands of topics.
 Beyond that a writer pool with topic affinity replaces it; that is a later
@@ -117,12 +118,15 @@ A receipt is issued only after the submission's bytes are fsynced to the
 AOF and the head sidecar has been atomically replaced. Order matters:
 
 1. Append the exact submitted bytes plus `0x0a` to the AOF in one write; fsync.
-2. Write (count, head hash) to a temporary file; fsync; rename over `head`.
+2. Write (count, head hash, byte length of the committed prefix) to a
+   temporary file; fsync; rename over `head`.
 3. Index the Event IDs; reply.
 
 On startup the writer reads `head`, measures the AOF and reconciles. The
-only crash window is between steps 1 and 2, which leaves at most one
-submission beyond the sidecar. Its lines are re-run through the acceptor,
+byte length in the sidecar is where any tail beyond it starts, so recovery
+reads the tail and not the file. The only crash window is between steps 1
+and 2, which leaves at most one submission beyond the sidecar. Its lines
+are re-run through the acceptor,
 one at a time from the sidecar's head, and if every verdict is Sound the
 sidecar is advanced over all of them. Anything else, including a torn last
 line, is a hard error: the operator is told the topic is inconsistent, and
@@ -141,9 +145,9 @@ submission per race window per topic, so there is nothing further to group.
 ```
 data/
   <topic>/
-    topic.json        settings: topic id, heartbeat interval, hub key id
+    topic.json        settings: topic id, heartbeat interval
     aof.jsonl         the artifact; append-only; exact bytes
-    head              count and head hash; replaced atomically
+    head              count, head hash and byte length of the committed prefix; replaced atomically
     heartbeats.jsonl  every heartbeat ever issued, append-only
     payloads/<ref>    ciphertext blobs
   index/              embedded key-value store: Event ID → (topic, position, byte offset)
@@ -164,7 +168,7 @@ proposed paper amendment, recorded as an ADR here.
 | Method and path | Body or query | Response |
 | --- | --- | --- |
 | `POST /topics` | topic settings | 201 |
-| `POST /topics/{t}/entries` | one or more lines joined by `0x0a`, no terminator; `Expected-Head` header | 201 receipt, or 409 refusal with the current head |
+| `POST /topics/{t}/entries` | one or more lines joined by `0x0a`, no terminator | 201 receipt, or 409 refusal with the current head |
 | `GET /topics/{t}/head` | | position and head hash |
 | `GET /topics/{t}/entries?after={event_id}` | | JSON Lines tail, exact bytes |
 | `GET /topics/{t}/aof` | | the whole file, exact bytes |
@@ -178,10 +182,12 @@ more lines, each the exact bytes of an Entry, joined by `0x0a` with no
 terminator after the last. A line is a JSON object and cannot contain a
 raw newline, so the separator is unambiguous, and a body that ends in
 `0x0a` is a batch whose last line is empty, which the acceptor refuses as
-malformed. `Expected-Head` is the head the first line was signed against;
-every later line is signed against the hash of the line before it in the
-body. The Hub appends the body and one `0x0a`, whole or not at all. A body
-of one line is the ordinary case and is not a special one.
+malformed. The first line's `prev_hash` is the head the Producer signed
+against, and there is no separate statement of it: the acceptor's chain
+check on that line is the Hub's compare. Every later line is signed against
+the hash of the line before it in the body. The Hub appends the body and
+one `0x0a`, whole or not at all. A body of one line is the ordinary case
+and is not a special one.
 
 Batches exist because the eventchain repo measured the append rule's
 ceiling as one submission per race window, where the window is one
@@ -210,8 +216,9 @@ of lines appended. The flat shape cannot carry a list of Event IDs; it does
 not need to, because `head_hash` is the last line's Event ID and binds every
 line before it, and the Producer computed the others when it signed. A
 refusal adds `reason`, drawn from a closed vocabulary that is the verifier's
-fault names plus `head_mismatch`; on a verifier fault it adds `line`, the
-ordinal of the refused line within the body, and on `head_mismatch` the
+fault names plus `head_mismatch`, which is the verifier's chain mismatch on
+the first line, the case the paper's step 4 names; on a verifier fault it
+adds `line`, the ordinal of the refused line within the body, and on `head_mismatch` the
 current `position` and `head_hash` so the submitter can fetch the extension
 without a second round trip.
 
