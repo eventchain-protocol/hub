@@ -2,17 +2,24 @@
 //! submission one line at a time through the acceptor, the first line
 //! against the head it holds, writes the whole submission or none of it,
 //! and answers the handler that sent it.
+//!
+//! The writer is also the one that extends the Event ID index, after the
+//! head sidecar and before it publishes the new head. Everything a reader can
+//! learn from the published head, an Event ID lookup can already find.
 
-use std::path::Path;
+use std::io::{self, Read};
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
 use bytes::Bytes;
+use reqwest::Url;
 use tokio::sync::oneshot;
 
 use crate::acceptor::{self, Fault, Verdict};
-use crate::store::{reconcile, Head, Reconcile, TopicDir};
+use crate::index::{Index, Located};
+use crate::store::{self, reconcile, HeartbeatLog, Head, Reconcile, TopicDir};
 
 /// How many submissions may wait for the writer before the handler answers 503.
 const QUEUE_DEPTH: usize = 64;
@@ -46,33 +53,64 @@ pub enum Backpressure {
 pub struct Topic {
     pub id: String,
     pub heartbeat_interval_seconds: u64,
+    pub heartbeat_hosts: Vec<Url>,
+    pub heartbeats: HeartbeatLog,
+    aof: PathBuf,
+    index: Arc<Index>,
     sender: SyncSender<Submission>,
     head: Arc<Mutex<Head>>,
 }
 
 impl Topic {
-    /// Open the directory, reconcile the sidecar with the file, and start the writer.
-    pub fn open(dir: &Path) -> Result<Topic, String> {
+    /// Open the directory, reconcile the sidecar with the file, catch the
+    /// index up with the committed head, and start the writer.
+    pub fn open(dir: &Path, index: Arc<Index>) -> Result<Topic, String> {
         let name = dir.file_name().and_then(|n| n.to_str()).ok_or("topic directory has no name")?.to_string();
         let (mut store, settings, sidecar) = TopicDir::open(dir).map_err(|e| format!("{name}: {e}"))?;
         if settings.topic_id != name {
             return Err(format!("{name}: topic.json names the topic {:?}", settings.topic_id));
         }
+        if settings.heartbeat_interval_seconds == 0 {
+            return Err(format!("{name}: topic.json: heartbeat_interval_seconds must be at least 1"));
+        }
+        let heartbeat_hosts = settings.heartbeat_hosts.iter().map(|host| heartbeat_host(&name, host)).collect::<Result<Vec<Url>, String>>()?;
+        let heartbeats = HeartbeatLog::open(dir).map_err(|e| format!("{name}: {e}"))?;
         let head = recover(&name, &mut store, sidecar.unwrap_or(Head::EMPTY))?;
+        index.catch_up(&name, &store, &head).map_err(|e| format!("{name}: {e}"))?;
         let published = Arc::new(Mutex::new(head));
         let (sender, receiver) = sync_channel(QUEUE_DEPTH);
-        let writer_head = Arc::clone(&published);
+        let (writer_head, writer_index) = (Arc::clone(&published), Arc::clone(&index));
         let id = name.clone();
         thread::Builder::new()
             .name(format!("writer:{name}"))
-            .spawn(move || run(&id, store, head, receiver, writer_head))
+            .spawn(move || run(&id, store, &writer_index, head, receiver, writer_head))
             .map_err(|e| format!("{name}: cannot start the writer thread: {e}"))?;
-        Ok(Topic { id: name, heartbeat_interval_seconds: settings.heartbeat_interval_seconds, sender, head: published })
+        Ok(Topic {
+            id: name,
+            heartbeat_interval_seconds: settings.heartbeat_interval_seconds,
+            heartbeat_hosts,
+            heartbeats,
+            aof: store::aof_path(dir),
+            index,
+            sender,
+            head: published,
+        })
     }
 
-    /// The committed head as the writer last published it.
+    /// The committed head as the writer last published it. Readers serve the file up to its length and no further.
     pub fn head(&self) -> Head {
         *self.head.lock().expect("the head lock is not poisoned")
+    }
+
+    pub fn aof_path(&self) -> &Path {
+        &self.aof
+    }
+
+    /// Where the line with this Event ID sits, if the index has it. The
+    /// writer indexes before it publishes, so a line the index has may lie
+    /// beyond the published head for a moment; the caller compares.
+    pub fn locate(&self, event_id: &[u8; 32]) -> Result<Option<Located>, String> {
+        self.index.locate(&self.id, event_id)
     }
 
     pub fn submit(&self, body: Bytes) -> Result<oneshot::Receiver<Outcome>, Backpressure> {
@@ -85,10 +123,20 @@ impl Topic {
     }
 }
 
+/// A heartbeat host from topic.json: an absolute http or https URL.
+fn heartbeat_host(name: &str, host: &str) -> Result<Url, String> {
+    let url = Url::parse(host).map_err(|e| format!("{name}: topic.json: heartbeat host {host:?}: {e}"))?;
+    if url.scheme() != "http" && url.scheme() != "https" {
+        return Err(format!("{name}: topic.json: heartbeat host {host:?} is not http or https"));
+    }
+    Ok(url)
+}
+
 /// The writer loop. An IO failure after a judgement is a hard error: the
 /// thread stops with the message, every waiting and later submission fails,
-/// and the operator reconciles the topic at the next start.
-fn run(id: &str, mut store: TopicDir, mut head: Head, receiver: Receiver<Submission>, published: Arc<Mutex<Head>>) {
+/// and the operator reconciles the topic at the next start. An index that
+/// cannot be extended stops it the same way; the next start catches it up.
+fn run(id: &str, mut store: TopicDir, index: &Index, mut head: Head, receiver: Receiver<Submission>, published: Arc<Mutex<Head>>) {
     for submission in receiver {
         let outcome = match judge(&head, &submission.body) {
             Err(outcome) => outcome,
@@ -96,6 +144,8 @@ fn run(id: &str, mut store: TopicDir, mut head: Head, receiver: Receiver<Submiss
                 let length = store.append(&submission.body, head.length).unwrap_or_else(|e| panic!("topic {id}: append failed: {e}"));
                 head = Head { count: head.count + count, hash, length };
                 store.write_head(&head).unwrap_or_else(|e| panic!("topic {id}: head sidecar not written: {e}"));
+                let mut lines = io::Cursor::new(&submission.body[..]).chain(&b"\n"[..]);
+                index.extend(id, &mut lines, &head).unwrap_or_else(|e| panic!("topic {id}: {e}"));
                 *published.lock().expect("the head lock is not poisoned") = head;
                 Outcome::Accepted { position: head.count, head_hash: head.hash, count }
             }

@@ -1,4 +1,8 @@
-//! The HTTP surface of milestone 2: the head of a topic, and submission.
+//! The HTTP surface: the head of a topic and submission here, distribution
+//! and the heartbeat list in the modules named for them.
+
+mod distribute;
+mod heartbeat;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -17,20 +21,31 @@ use crate::signer::{base64url, issued_at_now, Statement};
 use crate::topic::{Backpressure, Outcome, Refusal, Topic};
 
 pub struct App {
-    pub key: Key,
-    pub topics: HashMap<String, Topic>,
+    pub key: Arc<Key>,
+    pub topics: HashMap<String, Arc<Topic>>,
+}
+
+impl App {
+    fn topic(&self, name: &str) -> Result<&Arc<Topic>, Response> {
+        self.topics.get(name).ok_or_else(|| (StatusCode::NOT_FOUND, "no such topic").into_response())
+    }
 }
 
 pub fn router(app: Arc<App>) -> Router {
     Router::new()
         .route("/topics/{topic}/head", get(head))
-        .route("/topics/{topic}/entries", axum::routing::post(submit))
+        .route("/topics/{topic}/entries", get(distribute::extension).post(submit))
+        .route("/topics/{topic}/aof", get(distribute::aof))
+        .route("/topics/{topic}/lookup/{event_id}", get(distribute::lookup))
+        .route("/topics/{topic}/heartbeat/latest", get(heartbeat::latest))
+        .route("/topics/{topic}/heartbeat", get(heartbeat::list))
         .with_state(app)
 }
 
 async fn head(Path(topic): Path<String>, State(app): State<Arc<App>>) -> Response {
-    let Some(topic) = app.topics.get(&topic) else {
-        return (StatusCode::NOT_FOUND, "no such topic").into_response();
+    let topic = match app.topic(&topic) {
+        Ok(topic) => topic,
+        Err(response) => return response,
     };
     let head = topic.head();
     let body = json!({"position": head.count.to_string(), "head_hash": base64url(&head.hash)});
@@ -38,8 +53,9 @@ async fn head(Path(topic): Path<String>, State(app): State<Arc<App>>) -> Respons
 }
 
 async fn submit(Path(topic): Path<String>, State(app): State<Arc<App>>, body: Bytes) -> Response {
-    let Some(topic) = app.topics.get(&topic) else {
-        return (StatusCode::NOT_FOUND, "no such topic").into_response();
+    let topic = match app.topic(&topic) {
+        Ok(topic) => topic,
+        Err(response) => return response,
     };
     let submission_hash: [u8; 32] = Sha256::digest(&body).into();
     let receiver = match topic.submit(body) {
@@ -83,4 +99,8 @@ async fn submit(Path(topic): Path<String>, State(app): State<Arc<App>>, body: By
 
 fn json_response(status: StatusCode, bytes: Vec<u8>) -> Response {
     (status, [(header::CONTENT_TYPE, "application/json")], bytes).into_response()
+}
+
+fn internal(message: impl Into<String>) -> Response {
+    (StatusCode::INTERNAL_SERVER_ERROR, message.into()).into_response()
 }

@@ -145,12 +145,12 @@ submission per race window per topic, so there is nothing further to group.
 ```
 data/
   <topic>/
-    topic.json        settings: topic id, heartbeat interval
+    topic.json        settings: topic id, heartbeat interval, heartbeat hosts
     aof.jsonl         the artifact; append-only; exact bytes
     head              count, head hash and byte length of the committed prefix; replaced atomically
     heartbeats.jsonl  every heartbeat ever issued, append-only
     payloads/<ref>    ciphertext blobs
-  index/              embedded key-value store: Event ID → (topic, position, byte offset)
+  index/              embedded key-value store: (topic, Event ID) → (position, byte offset, line length)
 ```
 
 The AOF is the artifact and no database holds it. The index is derived and
@@ -158,6 +158,9 @@ rebuildable from the files; it is never authoritative. It lives in `redb`,
 a pure-Rust embedded store, so startup is O(1) and memory stays bounded
 however many Entries exist. An in-memory map would be simpler and was
 rejected because it grows without bound and is lost on every restart.
+The key is the pair (topic, Event ID) rather than the Event ID alone,
+because an Entry names no topic and the same line can be committed in two
+topics, which would otherwise collide.
 
 ## Decision 5: the HTTP surface, and the three encodings it fixes
 
@@ -241,8 +244,11 @@ reference says so.
 
 The heartbeat scheduler ticks per topic at the topic's interval, asks the
 writer thread for (count, head), signs the statement and appends it to
-`heartbeats.jsonl`. The Hub serves the list endpoints itself, and when a
-keeper URL is configured it also POSTs each heartbeat there. Serving the
+`heartbeats.jsonl`. The Hub serves the list endpoints itself, and it also
+POSTs each heartbeat to every URL in the topic's `heartbeat_hosts`, a list
+in the topic's settings rather than one keeper URL for the Hub, because the
+protocol has a topic trust several hosts and the topic's agreed settings
+decide which. Serving the
 list from the Hub is a documented weakening: it lets a single holder detect
 staleness, but a Hub that is its own keeper can show two holders two lists.
 The keeper role is the foundation's, and the reference Hub is built so the
@@ -275,7 +281,8 @@ src/
   main.rs      configuration and wiring only
   acceptor/    safe Rust wrapper over the C ABI, runtime lifecycle
   topic/       the writer thread: compare, accept, append, fsync, recover
-  store/       AOF file, head sidecar, heartbeat file, payload blobs, index
+  store/       AOF file, head sidecar, heartbeat file, payload blobs
+  index/       the Event ID index; its own concept, not a file of the store, because it is derived from the AOF and rebuilt from it
   api/         routes, one file per resource
   heartbeat/   scheduler and publisher
   signer/      the trait and the Haskell-backed implementation

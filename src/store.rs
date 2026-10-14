@@ -1,10 +1,12 @@
-//! The files under `data/<topic>/`: the settings, the AOF, and the head
-//! sidecar. File IO only; what the bytes mean is the writer's business.
+//! The files under `data/<topic>/`: the settings, the AOF, the head
+//! sidecar and the heartbeat list. File IO only; what the bytes mean is the
+//! writer's business, and the heartbeat scheduler's.
 
+mod heartbeats;
 mod recover;
 
 use std::fs::{self, File, OpenOptions};
-use std::io;
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
@@ -13,6 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::acceptor::GENESIS;
 
+pub use heartbeats::HeartbeatLog;
 pub use recover::{reconcile, Reconcile};
 
 /// `topic.json`. Every member is required and nothing else is allowed.
@@ -21,6 +24,13 @@ pub use recover::{reconcile, Reconcile};
 pub struct TopicSettings {
     pub topic_id: String,
     pub heartbeat_interval_seconds: u64,
+    /// Where each heartbeat is POSTed once it is issued. May be empty.
+    pub heartbeat_hosts: Vec<String>,
+}
+
+/// The AOF of the topic in `dir`. Readers open it by path; only the writer holds it open for writing.
+pub fn aof_path(dir: &Path) -> PathBuf {
+    dir.join("aof.jsonl")
 }
 
 /// The committed prefix: how many lines, the last line's hash, and the
@@ -55,7 +65,7 @@ impl TopicDir {
     pub fn open(dir: &Path) -> io::Result<(TopicDir, TopicSettings, Option<Head>)> {
         let settings_bytes = fs::read(dir.join("topic.json"))?;
         let settings: TopicSettings = serde_json::from_slice(&settings_bytes).map_err(|e| io::Error::other(format!("topic.json: {e}")))?;
-        let aof = OpenOptions::new().create(true).write(true).read(true).open(dir.join("aof.jsonl"))?;
+        let aof = OpenOptions::new().create(true).write(true).read(true).open(aof_path(dir))?;
         let sidecar = match fs::read(dir.join("head")) {
             Ok(bytes) => Some(parse_sidecar(&bytes)?),
             Err(e) if e.kind() == io::ErrorKind::NotFound => None,
@@ -74,6 +84,20 @@ impl TopicDir {
         let mut tail = vec![0u8; (length - from) as usize];
         self.aof.read_exact_at(&mut tail, from)?;
         Ok(tail)
+    }
+
+    /// `length` bytes from `offset`.
+    pub fn read_at(&self, offset: u64, length: u64) -> io::Result<Vec<u8>> {
+        let mut bytes = vec![0u8; length as usize];
+        self.aof.read_exact_at(&mut bytes, offset)?;
+        Ok(bytes)
+    }
+
+    /// The bytes from `from` to `to`, read as they are consumed rather than all at once.
+    pub fn read_range(&self, from: u64, to: u64) -> io::Result<impl BufRead> {
+        let mut file = self.aof.try_clone()?;
+        file.seek(SeekFrom::Start(from))?;
+        Ok(BufReader::new(file.take(to - from)))
     }
 
     /// Append the body and one terminator in one write, fsync, and return the new length.
