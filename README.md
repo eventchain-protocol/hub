@@ -71,6 +71,25 @@ checkout cabal makes under `acceptor/dist-newstyle/src/`:
 (cd acceptor && cabal test)
 ```
 
+### The end-to-end run
+
+`tools/producer/` is a real client of the Hub: a Producer built on the
+upstream eventchain Producer and Verifier at the acceptor's pinned commit.
+Its driver starts a fresh Hub on a temporary data directory, creates a topic
+over HTTP, mints entries under a random key, puts their payloads, submits
+them from the live head in several rounds, including a stale head and a line
+altered after signing, fetches the whole file, the extension and a lookup,
+verifies the served file with the upstream verifier, checks every payload
+against its entry's `payload_hash`, checks a heartbeat, restarts the Hub and
+submits again. Every check prints `PASS` or `FAIL` and the exit status is
+the count of failures. This run stands in for the tests the Hub does not
+write.
+
+```sh
+(cd tools/producer && cabal build)
+tools/producer/run.sh
+```
+
 ## Usage
 
 The Hub reads four environment variables.
@@ -209,6 +228,8 @@ src/
   api.rs       the head and submission routes; topics.rs creation, distribute.rs the extension, file and lookup,
                heartbeat.rs the list, payloads.rs the blobs, subscriptions.rs subscribing
 build.rs       links the acceptor library built by cabal
+tools/
+  producer/    the end-to-end run: a Producer on the upstream libraries, its driver, and the statement signature check
 docs/
   plan.md      the design of the v1 Hub
 ```

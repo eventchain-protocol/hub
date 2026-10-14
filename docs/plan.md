@@ -318,6 +318,8 @@ src/
   access/      the AccessPolicy trait, its token implementation and the operator token; its own concept because routes ask it and never read a credential
   signer/      the trait and the Haskell-backed implementation
   webhook/     subscriptions and delivery with retry
+tools/
+  producer/    the end-to-end run: not part of the Hub, the client that grades it
 docs/
   plan.md      this document
   adr/         one record per fixed encoding and per boundary decision
@@ -341,7 +343,10 @@ a bug would be silent. These places qualify:
 
 Everything else is exercised by running the Hub against a Producer and
 verifying the resulting file with the verifier, which is what the file is
-for.
+for. That run is `tools/producer/`: a Producer on the upstream eventchain
+libraries at the acceptor's pinned commit, and a driver that mints, puts
+payloads, submits from the live head, refuses a stale head and an altered
+line, fetches and verifies the served file, and restarts.
 
 ## Build
 

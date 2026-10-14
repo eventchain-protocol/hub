@@ -1,0 +1,11 @@
+cabal-version: 3.0
+name:          hub-producer
+version:       0.1.0.0
+build-type:    Simple
+
+executable producer
+    main-is:          Main.hs
+    default-language: GHC2024
+    ghc-options:      -Wall
+    build-depends:
+        base, bytestring, text, base64 >=1.0, eventchain, eventchain-crypto, eventchain-verify

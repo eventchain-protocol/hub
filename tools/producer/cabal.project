@@ -1,0 +1,12 @@
+-- The end-to-end Producer: a real client of the Hub, built on the upstream
+-- eventchain Producer and Verifier at the same pinned commit the acceptor
+-- uses, so what it mints and what the Hub judges come from one revision of
+-- the protocol. It is the run the plan's Tests section names in place of
+-- tests: mint, submit, distribute, verify the served file.
+packages: .
+
+source-repository-package
+    type: git
+    location: https://github.com/eventchain-protocol/eventchain.git
+    tag: 55b38b5a9986f1e19b00aba352267b324c9604de
+    subdir: eventchain eventchain-crypto eventchain-verify
