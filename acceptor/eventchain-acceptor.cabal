@@ -1,0 +1,25 @@
+cabal-version:      3.14
+name:               eventchain-acceptor
+version:            0.1.0.0
+synopsis:           C ABI over the eventchain libraries for the reference Hub
+license:            BSD-3-Clause
+license-file:       LICENSE
+build-type:         Simple
+tested-with:        GHC ==9.12.4
+
+-- One shared library. The Hub, written in Rust, loads it and calls the
+-- functions declared in include/eventchain_acceptor.h. Nothing but bytes and
+-- status codes cross that boundary.
+foreign-library eventchain_acceptor
+    type:               native-shared
+    hs-source-dirs:     src
+    other-modules:      EventChain.Acceptor.FFI
+    c-sources:          cbits/rts.c
+    include-dirs:       include
+    install-includes:   eventchain_acceptor.h
+    default-language:   GHC2024
+    ghc-options:        -Wall -threaded
+    build-depends:
+        , base              >=4.20 && <5
+        , bytestring        >=0.12 && <0.14
+        , eventchain-crypto
