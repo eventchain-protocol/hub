@@ -6,6 +6,13 @@
 //! The writer is also the one that extends the Event ID index, after the
 //! head sidecar and before it publishes the new head. Everything a reader can
 //! learn from the published head, an Event ID lookup can already find.
+//!
+//! A `Topic` is also the handle the rest of the Hub holds for everything
+//! else under the topic's directory: its settings, heartbeat list, payload
+//! blobs, access policy and subscriptions. Those are not the writer's; they
+//! sit here because they open and close with the topic.
+
+mod settings;
 
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -17,9 +24,13 @@ use bytes::Bytes;
 use reqwest::Url;
 use tokio::sync::oneshot;
 
+use crate::access::AccessPolicy;
 use crate::acceptor::{self, Fault, Verdict};
 use crate::index::{Index, Located};
-use crate::store::{self, reconcile, HeartbeatLog, Head, Reconcile, TopicDir};
+use crate::store::{self, reconcile, HeartbeatLog, Head, Payloads, Reconcile, SubscriptionLog, TopicDir};
+
+pub use settings::http_url;
+use settings::Settings;
 
 /// How many submissions may wait for the writer before the handler answers 503.
 const QUEUE_DEPTH: usize = 64;
@@ -50,11 +61,25 @@ pub enum Backpressure {
     Stopped,
 }
 
+/// Why `POST /topics` made no topic.
+pub enum NotCreated {
+    /// The body is not a `topic.json` the Hub would open: a 400.
+    Invalid(String),
+    /// `data/<topic_id>/` exists: a 409.
+    Exists,
+    /// The directory or the topic could not be made: a 500.
+    Failed(String),
+}
+
 pub struct Topic {
     pub id: String,
     pub heartbeat_interval_seconds: u64,
     pub heartbeat_hosts: Vec<Url>,
     pub heartbeats: HeartbeatLog,
+    pub payloads: Payloads,
+    /// The topic's payload and subscription policy. Handlers ask it; they never read a credential themselves.
+    pub access: Box<dyn AccessPolicy>,
+    pub subscriptions: SubscriptionLog,
     aof: PathBuf,
     index: Arc<Index>,
     sender: SyncSender<Submission>,
@@ -70,11 +95,13 @@ impl Topic {
         if settings.topic_id != name {
             return Err(format!("{name}: topic.json names the topic {:?}", settings.topic_id));
         }
-        if settings.heartbeat_interval_seconds == 0 {
-            return Err(format!("{name}: topic.json: heartbeat_interval_seconds must be at least 1"));
-        }
-        let heartbeat_hosts = settings.heartbeat_hosts.iter().map(|host| heartbeat_host(&name, host)).collect::<Result<Vec<Url>, String>>()?;
+        let settings = Settings::check(settings)?;
         let heartbeats = HeartbeatLog::open(dir).map_err(|e| format!("{name}: {e}"))?;
+        let payloads = Payloads::open(dir).map_err(|e| format!("{name}: payloads: {e}"))?;
+        let subscriptions = SubscriptionLog::open(dir).map_err(|e| format!("{name}: {e}"))?;
+        for url in subscriptions.all() {
+            subscription(&url).map_err(|e| format!("{name}: subscriptions.jsonl: {e}"))?;
+        }
         let head = recover(&name, &mut store, sidecar.unwrap_or(Head::EMPTY))?;
         index.catch_up(&name, &store, &head).map_err(|e| format!("{name}: {e}"))?;
         let published = Arc::new(Mutex::new(head));
@@ -88,13 +115,30 @@ impl Topic {
         Ok(Topic {
             id: name,
             heartbeat_interval_seconds: settings.heartbeat_interval_seconds,
-            heartbeat_hosts,
+            heartbeat_hosts: settings.heartbeat_hosts,
             heartbeats,
+            payloads,
+            access: Box::new(settings.access),
+            subscriptions,
             aof: store::aof_path(dir),
             index,
             sender,
             head: published,
         })
+    }
+
+    /// Make `data/<topic_id>/` from the bytes of a `topic.json` and open it.
+    /// The settings are checked before anything is written, so a body the
+    /// Hub would refuse to open leaves no directory behind. Blocking IO.
+    pub fn create(data: &Path, body: &[u8], index: Arc<Index>) -> Result<Topic, NotCreated> {
+        let settings = store::parse_settings(body).map_err(NotCreated::Invalid)?;
+        let id = Settings::check(settings).map_err(NotCreated::Invalid)?.id;
+        let dir = match store::create_topic_dir(data, &id, body) {
+            Ok(dir) => dir,
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Err(NotCreated::Exists),
+            Err(e) => return Err(NotCreated::Failed(format!("{id}: creating the directory: {e}"))),
+        };
+        Topic::open(&dir, index).map_err(NotCreated::Failed)
     }
 
     /// The committed head as the writer last published it. Readers serve the file up to its length and no further.
@@ -123,13 +167,14 @@ impl Topic {
     }
 }
 
-/// A heartbeat host from topic.json: an absolute http or https URL.
-fn heartbeat_host(name: &str, host: &str) -> Result<Url, String> {
-    let url = Url::parse(host).map_err(|e| format!("{name}: topic.json: heartbeat host {host:?}: {e}"))?;
-    if url.scheme() != "http" && url.scheme() != "https" {
-        return Err(format!("{name}: topic.json: heartbeat host {host:?} is not http or https"));
+/// A subscription as the file holds it: an http or https URL, written in
+/// the normal form it was stored in, so that one URL is one line.
+fn subscription(text: &str) -> Result<(), String> {
+    let url = http_url(text)?;
+    if url.as_str() != text {
+        return Err(format!("{text:?} is not in normal form, which is {:?}", url.as_str()));
     }
-    Ok(url)
+    Ok(())
 }
 
 /// The writer loop. An IO failure after a judgement is a hard error: the

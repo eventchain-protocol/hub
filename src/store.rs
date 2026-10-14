@@ -1,9 +1,13 @@
 //! The files under `data/<topic>/`: the settings, the AOF, the head
-//! sidecar and the heartbeat list. File IO only; what the bytes mean is the
-//! writer's business, and the heartbeat scheduler's.
+//! sidecar, the heartbeat list, the payload blobs and the subscriptions.
+//! File IO only; what the bytes mean is the writer's business, the heartbeat
+//! scheduler's and the webhook deliverer's.
 
 mod heartbeats;
+mod payloads;
 mod recover;
+mod segment;
+mod subscriptions;
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
@@ -15,8 +19,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::acceptor::GENESIS;
 
+use crate::access::Grant;
+
 pub use heartbeats::HeartbeatLog;
+pub use payloads::{Payloads, Put};
 pub use recover::{reconcile, Reconcile};
+pub use segment::is_safe_segment;
+pub use subscriptions::SubscriptionLog;
 
 /// `topic.json`. Every member is required and nothing else is allowed.
 #[derive(Deserialize)]
@@ -26,6 +35,29 @@ pub struct TopicSettings {
     pub heartbeat_interval_seconds: u64,
     /// Where each heartbeat is POSTed once it is issued. May be empty.
     pub heartbeat_hosts: Vec<String>,
+    /// The bearer tokens that may reach the topic's payloads, and as what. May be empty.
+    pub access: Vec<Grant>,
+}
+
+/// The bytes of a `topic.json`, read against the schema and nothing more.
+pub fn parse_settings(bytes: &[u8]) -> Result<TopicSettings, String> {
+    serde_json::from_slice(bytes).map_err(|e| format!("topic.json: {e}"))
+}
+
+/// Make `data/<id>/` and write `bytes` as its `topic.json`. The directory
+/// is made exclusively, so an existing one is `AlreadyExists` and is left
+/// as it was. `id` must already be a safe segment.
+pub fn create_topic_dir(data: &Path, id: &str, bytes: &[u8]) -> io::Result<PathBuf> {
+    let dir = data.join(id);
+    fs::create_dir(&dir)?;
+    let temporary = dir.join("topic.json.tmp");
+    let mut file = File::create(&temporary)?;
+    io::Write::write_all(&mut file, bytes)?;
+    file.sync_all()?;
+    fs::rename(&temporary, dir.join("topic.json"))?;
+    File::open(&dir)?.sync_all()?;
+    File::open(data)?.sync_all()?;
+    Ok(dir)
 }
 
 /// The AOF of the topic in `dir`. Readers open it by path; only the writer holds it open for writing.
@@ -63,8 +95,7 @@ pub struct TopicDir {
 impl TopicDir {
     /// Open the directory's files. The sidecar is absent for a topic that has never committed.
     pub fn open(dir: &Path) -> io::Result<(TopicDir, TopicSettings, Option<Head>)> {
-        let settings_bytes = fs::read(dir.join("topic.json"))?;
-        let settings: TopicSettings = serde_json::from_slice(&settings_bytes).map_err(|e| io::Error::other(format!("topic.json: {e}")))?;
+        let settings = parse_settings(&fs::read(dir.join("topic.json"))?).map_err(io::Error::other)?;
         let aof = OpenOptions::new().create(true).write(true).read(true).open(aof_path(dir))?;
         let sidecar = match fs::read(dir.join("head")) {
             Ok(bytes) => Some(parse_sidecar(&bytes)?),

@@ -34,7 +34,7 @@ pub struct Range {
 
 pub async fn list(Path(topic): Path<String>, Query(range): Query<Range>, State(app): State<Arc<App>>) -> Response {
     let topic = match app.topic(&topic) {
-        Ok(topic) => Arc::clone(topic),
+        Ok(topic) => topic,
         Err(response) => return response,
     };
     let bound = |text: Option<String>| text.map(|t| Timestamp::parse(&t)).transpose().map_err(|e| (StatusCode::BAD_REQUEST, e).into_response());

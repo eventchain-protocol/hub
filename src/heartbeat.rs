@@ -26,11 +26,20 @@ use crate::topic::Topic;
 
 pub use window::{Timestamp, Window};
 
-/// One task per topic, for the life of the process.
-pub fn start(key: Arc<Key>, topics: Vec<Arc<Topic>>) {
-    let client = Client::new();
-    for topic in topics {
-        tokio::spawn(beat(Arc::clone(&key), topic, client.clone()));
+/// Starts one task per topic, for the life of the process: the topics found
+/// at startup and every topic created after.
+pub struct Scheduler {
+    key: Arc<Key>,
+    client: Client,
+}
+
+impl Scheduler {
+    pub fn new(key: Arc<Key>) -> Scheduler {
+        Scheduler { key, client: Client::new() }
+    }
+
+    pub fn start(&self, topic: Arc<Topic>) {
+        tokio::spawn(beat(Arc::clone(&self.key), topic, self.client.clone()));
     }
 }
 

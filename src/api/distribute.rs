@@ -50,7 +50,7 @@ pub async fn extension(Path(topic): Path<String>, Query(After { after }): Query<
     let start = if event_id == GENESIS {
         0
     } else {
-        match committed_line(topic, &event_id).await {
+        match committed_line(&topic, &event_id).await {
             Ok(Some((located, _))) => located.end(),
             Ok(None) => return (StatusCode::NOT_FOUND, "no line with that Event ID").into_response(),
             Err(response) => return response,
@@ -77,7 +77,7 @@ pub async fn lookup(Path((topic, event_id_text)): Path<(String, String)>, State(
         Ok(event_id) => event_id,
         Err(response) => return response,
     };
-    let (located, line) = match committed_line(topic, &event_id).await {
+    let (located, line) = match committed_line(&topic, &event_id).await {
         Ok(Some(found)) => found,
         Ok(None) => return (StatusCode::NOT_FOUND, "no line with that Event ID").into_response(),
         Err(response) => return response,

@@ -145,11 +145,12 @@ submission per race window per topic, so there is nothing further to group.
 ```
 data/
   <topic>/
-    topic.json        settings: topic id, heartbeat interval, heartbeat hosts
+    topic.json        settings: topic id, heartbeat interval, heartbeat hosts, access tokens
     aof.jsonl         the artifact; append-only; exact bytes
     head              count, head hash and byte length of the committed prefix; replaced atomically
     heartbeats.jsonl  every heartbeat ever issued, append-only
     payloads/<ref>    ciphertext blobs
+    subscriptions.jsonl  the URLs receipts are POSTed to, one per line
   index/              embedded key-value store: (topic, Event ID) → (position, byte offset, line length)
 ```
 
@@ -170,7 +171,7 @@ proposed paper amendment, recorded as an ADR here.
 
 | Method and path | Body or query | Response |
 | --- | --- | --- |
-| `POST /topics` | topic settings | 201 |
+| `POST /topics` | topic settings, operator token | 201 |
 | `POST /topics/{t}/entries` | one or more lines joined by `0x0a`, no terminator | 201 receipt, or 409 refusal with the current head |
 | `GET /topics/{t}/head` | | position and head hash |
 | `GET /topics/{t}/entries?after={event_id}` | | JSON Lines tail, exact bytes |
@@ -178,7 +179,7 @@ proposed paper amendment, recorded as an ADR here.
 | `GET /topics/{t}/lookup/{event_id}` | | position and the line |
 | `GET /topics/{t}/heartbeat/latest`, `/heartbeat`, `/heartbeat?from=&until=` | | as the specification appendix states |
 | `PUT`, `GET /topics/{t}/payloads/{ref}` | ciphertext | gated by the access policy |
-| `POST /topics/{t}/subscriptions` | a URL | 201; each commit is POSTed to it |
+| `POST /topics/{t}/subscriptions` | a URL, write token | 201; each commit's receipt is POSTed to it |
 
 **Submission.** The body is the extension the Producer proposes: one or
 more lines, each the exact bytes of an Entry, joined by `0x0a` with no
@@ -232,7 +233,27 @@ and the Hub does nothing to soften it.
 
 **Topic creation.** The binding between a topic and its first Entry is open
 in the paper and the Hub does not invent one. `POST /topics` records
-settings only.
+settings only. v1 encoding: the body is exactly a `topic.json`, every
+member required and no other allowed, and only the operator's bearer token,
+`HUB_ADMIN_TOKEN`, which the Hub refuses to start without, may create a
+topic; a topic whose directory exists is a 409. The topic does not exist
+before the request, so no topic policy can gate it, and the operator is the
+party who already decides which topics a Hub carries.
+
+**Payloads.** v1 encoding: a Payload is stored as exactly the bytes put,
+under a ref that is one safe file name, and is never replaced: a put of the
+same bytes to a taken ref is a 200, of other bytes a 409. The chain binds a
+`payload_ref` to one Payload through its hash, so a store that let a ref
+change would only ever serve bytes that fail that check.
+
+**Webhooks.** v1 encoding: what is POSTed to a subscriber is the receipt,
+the exact signed bytes the Producer got, and only for an accepted
+submission. A delivery is one attempt and four retries after waits of 1,
+4, 16 and 64 seconds in turn, each attempt given 10 seconds, a 2xx and
+nothing else counting as delivered. Deliveries are held in memory, so a restart drops the
+undelivered: the file is the record and a webhook only a prompt to read it,
+so a subscriber reconciles through `entries?after=` and a durable queue
+would add a second record of what the AOF already holds.
 
 ## Decision 6: the Hub key and the heartbeat list
 
@@ -262,6 +283,15 @@ to a role, where a role may read all of a topic's Payloads or none. That is
 enough to show the Hub enforcing policy without decryption keys and not
 enough to be mistaken for an authorisation system.
 
+v1 encoding: the tokens are the `access` member of `topic.json`, each with
+the role `read`, which may get every Payload of the topic, or `write`, which
+may also put Payloads and subscribe to the topic. Putting needs a role
+beyond reading because a Hub that took any bytes from anyone would let a
+stranger occupy a ref; subscribing rides on `write` rather than a third
+role because a subscriber is a party the topic already trusts with its
+Payloads. No token or an unknown one is a 401, a token without the role a
+403, and tokens are compared in constant time.
+
 ## What is out of scope and why
 
 - Registries: a registry is a topic like any other, so the Hub needs no
@@ -285,6 +315,7 @@ src/
   index/       the Event ID index; its own concept, not a file of the store, because it is derived from the AOF and rebuilt from it
   api/         routes, one file per resource
   heartbeat/   scheduler and publisher
+  access/      the AccessPolicy trait, its token implementation and the operator token; its own concept because routes ask it and never read a credential
   signer/      the trait and the Haskell-backed implementation
   webhook/     subscriptions and delivery with retry
 docs/
@@ -297,13 +328,16 @@ Each directory is one concept. No file in `src/` carries two of them.
 ## Tests
 
 Under this repo's rules, tests exist only where a pure function branches and
-a bug would be silent. Two places qualify:
+a bug would be silent. These places qualify:
 
 - The acceptor's conformance test: every committed eventchain vector pushed
   through the C ABI one line at a time, asserting the verdict the verifier
   gives. Bytes in, enum out, no mock.
 - Crash recovery: the reconciliation rule over (sidecar, file length,
   trailing lines) is a pure decision with four outcomes.
+- The file-name rule for topic ids and payload refs, added with topic
+  creation and payloads, because a request now names a path and a wrong
+  answer is a traversal nobody sees.
 
 Everything else is exercised by running the Hub against a Producer and
 verifying the resulting file with the verifier, which is what the file is
