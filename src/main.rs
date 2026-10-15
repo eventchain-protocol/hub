@@ -1,18 +1,20 @@
-//! Spike: a web server that signs whatever JSON is posted to `/` with the
-//! eventchain library. Not conforming to the protocol; it exists to prove the
-//! Rust-to-Haskell seam end to end.
+//! Configuration and wiring. Everything else lives in the module named for
+//! the concept it carries.
 
+mod access;
 mod acceptor;
+mod api;
+mod heartbeat;
+mod index;
+mod signer;
+mod store;
+mod topic;
+mod webhook;
 
-use std::sync::Arc;
-
-use axum::{body::Bytes, extract::State, http::StatusCode, routing::post, Json, Router};
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use serde_json::{json, Value};
-
-struct App {
-    key: acceptor::Key,
-}
+use std::collections::HashMap;
+use std::fs;
+use std::path::Path;
+use std::sync::{Arc, RwLock};
 
 fn key_from_env() -> acceptor::Key {
     let hex = std::env::var("HUB_KEY").expect("HUB_KEY must be set to 64 hex characters");
@@ -21,24 +23,56 @@ fn key_from_env() -> acceptor::Key {
         .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("HUB_KEY must be hex"))
         .collect();
     let bytes: [u8; 32] = bytes.try_into().expect("HUB_KEY must be 32 bytes");
-    acceptor::Key::from_bytes(bytes)
+    acceptor::Key::load(bytes).unwrap_or_else(|e| panic!("HUB_KEY is not a P-256 private scalar: {e:?}"))
 }
 
-async fn sign(State(app): State<Arc<App>>, body: Bytes) -> Result<Json<Value>, (StatusCode, String)> {
-    serde_json::from_slice::<Value>(&body).map_err(|e| (StatusCode::BAD_REQUEST, format!("body is not JSON: {e}")))?;
-    let signature = app.key.sign(&body).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:?}")))?;
-    let public_key = app.key.public_key().map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:?}")))?;
-    Ok(Json(json!({
-        "signature": URL_SAFE_NO_PAD.encode(signature),
-        "public_key": URL_SAFE_NO_PAD.encode(public_key),
-    })))
+fn operator_from_env() -> access::Operator {
+    let token = std::env::var("HUB_ADMIN_TOKEN").expect("HUB_ADMIN_TOKEN must be set to the operator's bearer token");
+    access::Operator::new(&token).unwrap_or_else(|e| panic!("HUB_ADMIN_TOKEN: {e}"))
+}
+
+/// Every directory under the data directory with a `topic.json` is a topic.
+/// Any of them failing to open stops the Hub. There may be none: topics are
+/// also created over HTTP.
+fn topics_from(data: &Path, index: &Arc<index::Index>) -> HashMap<String, Arc<topic::Topic>> {
+    let entries = fs::read_dir(data).unwrap_or_else(|e| panic!("data directory {}: {e}", data.display()));
+    let mut topics = HashMap::new();
+    for entry in entries {
+        let path = entry.expect("a readable directory entry").path();
+        if !path.join("topic.json").is_file() {
+            continue;
+        }
+        let topic = topic::Topic::open(&path, Arc::clone(index)).unwrap_or_else(|e| panic!("{e}"));
+        topics.insert(topic.id.clone(), Arc::new(topic));
+    }
+    topics
 }
 
 #[tokio::main]
 async fn main() {
     let _runtime = acceptor::Runtime::start();
-    let app = Arc::new(App { key: key_from_env() });
-    let router = Router::new().route("/", post(sign)).with_state(app);
+    let key = Arc::new(key_from_env());
+    let operator = operator_from_env();
+    let data = std::env::var("HUB_DATA").unwrap_or_else(|_| "data".to_string());
+    println!("hub key {}", signer::base64url(&key.public_key()));
+    let index = Arc::new(index::Index::open(&Path::new(&data).join("index")).unwrap_or_else(|e| panic!("{e}")));
+    let topics = topics_from(Path::new(&data), &index);
+    let heartbeats = heartbeat::Scheduler::new(Arc::clone(&key));
+    for (id, topic) in &topics {
+        let head = topic.head();
+        println!("topic {id}: {} entries, heartbeat every {} s to {} hosts, {} subscriptions", head.count, topic.heartbeat_interval_seconds, topic.heartbeat_hosts.len(), topic.subscriptions.all().len());
+        heartbeats.start(Arc::clone(topic));
+    }
+    let app = api::App {
+        key,
+        topics: RwLock::new(topics),
+        data: Path::new(&data).to_path_buf(),
+        index,
+        operator,
+        heartbeats,
+        webhooks: webhook::Deliveries::new(),
+    };
+    let router = api::router(Arc::new(app));
     let addr = std::env::var("HUB_ADDR").unwrap_or_else(|_| "127.0.0.1:3717".to_string());
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap_or_else(|e| panic!("bind {addr}: {e}"));
     println!("listening on http://{addr}");

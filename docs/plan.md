@@ -54,14 +54,30 @@ vocabulary doc already names as the Hub's relationship to those packages.
   zero means the genesis rule applies.
 - *Load the Hub key.* Key bytes in once at startup, an opaque handle out.
   The private key never comes back across the boundary.
-- *Sign a statement.* A heartbeat, receipt or refusal is a flat JSON object
-  of string members. The Haskell side canonicalises it with JCS and signs it
-  with the handle; the signature comes back. Canonicalisation stays on the
-  Haskell side so that there is one JCS implementation in the Hub, and it is
-  one that is already gated against the aeson RFC 8785 oracle.
+- *Sign bytes.* A heartbeat, receipt or refusal is a flat JSON object of
+  string members with ASCII names. The Rust side serialises it in JCS form,
+  members sorted by name and strings escaped per RFC 8785 §3.2.2.2, which
+  for a string-only object is exactly what serde_json writes from a sorted
+  map. The ABI signs the bytes it is given with the handle; the signature
+  comes back. Canonicalisation was to live on the Haskell side so that the
+  Hub would reuse eventchain's oracle-gated JCS. Neither eventchain
+  canonicaliser takes anything but an Entry object, so there was nothing to
+  reuse, and the Hub has to serialise the final object with its signature
+  member on the Rust side anyway. One serialiser on one side, rather than
+  two that agree by coincidence.
 
 **What the ABI does not do.** It verifies one line per call. The Hub never
 hands it a file. Bulk verification is the verifier's own job, from the file.
+
+A batched submission (Decision 5) does not change this. A batch is N
+ordinary lines, each signed against the hash of the one before it, so the
+writer thread calls the accept function N times, giving each call the hash
+the previous call returned as the current head. That is the same chain
+check the verifier's fold makes over the same bytes. The eventchain repo's
+hub-append-rate note measured that the verifier re-promotes the key on every
+call, so one line per call costs more than a fold over the batch would; that
+is a cost this Hub has not measured, and an accept-many-lines function is
+a later change behind the same header, made only once it is.
 
 **Limits this carries.** The GHC runtime runs inside the Hub process. GHC
 9.12 and libcrypto 3.2+ are build dependencies, and libcrypto is a runtime
@@ -78,15 +94,19 @@ that the structure, not a lock discipline:
 HTTP handler ──submission──▶ topic writer thread ──receipt/refusal──▶ handler
                                    │
                         owns: AOF file handle, head (count, hash)
-                        does: compare head, call acceptor, append, fsync,
-                              write head sidecar, index Event ID
+                        does: call acceptor once per line, the first
+                              against the head; append the submission; fsync;
+                              write head sidecar, index Event IDs
 ```
 
-The handler is async; the writer is a plain OS thread that blocks on the
-acceptor call (about 50 µs) and the fsync. Submissions arrive over a bounded
+A submission is one or more lines (Decision 5). The writer judges every
+line before it writes any, and writes all or none. The handler is async;
+the writer is a plain OS thread that blocks on the acceptor calls (about
+50 µs each) and the fsync. Submissions arrive over a bounded
 channel, so back-pressure reaches the HTTP layer as a 503 rather than an
-unbounded queue. The compare-and-swap on the expected head happens on the
-writer thread, where there is nothing to race.
+unbounded queue. The compare-and-swap on the head is the acceptor's chain
+check on the first line, run on the writer thread, where there is nothing
+to race.
 
 **Limit.** A thread per topic is right for tens to low thousands of topics.
 Beyond that a writer pool with topic affinity replaces it; that is a later
@@ -94,38 +114,44 @@ change inside one module, and it is not built now.
 
 ## Decision 3: durability rule and crash recovery
 
-A receipt is issued only after the line's bytes are fsynced to the AOF and
-the head sidecar has been atomically replaced. Order matters:
+A receipt is issued only after the submission's bytes are fsynced to the
+AOF and the head sidecar has been atomically replaced. Order matters:
 
-1. Append the exact submitted bytes plus `0x0a` to the AOF; fsync.
-2. Write (count, head hash) to a temporary file; fsync; rename over `head`.
-3. Index the Event ID; reply.
+1. Append the exact submitted bytes plus `0x0a` to the AOF in one write; fsync.
+2. Write (count, head hash, byte length of the committed prefix) to a
+   temporary file; fsync; rename over `head`.
+3. Index the Event IDs; reply.
 
 On startup the writer reads `head`, measures the AOF and reconciles. The
-only crash window is between steps 1 and 2, which leaves at most one line
-beyond the sidecar. That line is re-run through the acceptor against the
-sidecar's head and, if Sound, the sidecar is advanced. Anything else is a
-hard error: the operator is told the topic is inconsistent, and the Hub does
-not guess.
+byte length in the sidecar is where any tail beyond it starts, so recovery
+reads the tail and not the file. The only crash window is between steps 1
+and 2, which leaves at most one submission beyond the sidecar. Its lines
+are re-run through the acceptor,
+one at a time from the sidecar's head, and if every verdict is Sound the
+sidecar is advanced over all of them. Anything else, including a torn last
+line, is a hard error: the operator is told the topic is inconsistent, and
+the Hub does not guess.
 
 The Hub trusts its own sidecar the way a holder trusts its own Checkpoint.
 It does not re-verify the whole AOF on every start. An operator who wants
 that runs the verifier on the file.
 
-Group commit is not built. The protocol commits one Entry per race window
-per topic, so there is never a batch to group.
+Group commit is not built. A batched submission is the Producer's group:
+its lines land in one write and one fsync, and the protocol commits one
+submission per race window per topic, so there is nothing further to group.
 
 ## Decision 4: storage is files, plus one embedded index
 
 ```
 data/
   <topic>/
-    topic.json        settings: topic id, heartbeat interval, hub key id
+    topic.json        settings: topic id, heartbeat interval, heartbeat hosts, access tokens
     aof.jsonl         the artifact; append-only; exact bytes
-    head              count and head hash; replaced atomically
+    head              count, head hash and byte length of the committed prefix; replaced atomically
     heartbeats.jsonl  every heartbeat ever issued, append-only
     payloads/<ref>    ciphertext blobs
-  index/              embedded key-value store: Event ID → (topic, position, byte offset)
+    subscriptions.jsonl  the URLs receipts are POSTed to, one per line
+  index/              embedded key-value store: (topic, Event ID) → (position, byte offset, line length)
 ```
 
 The AOF is the artifact and no database holds it. The index is derived and
@@ -133,6 +159,9 @@ rebuildable from the files; it is never authoritative. It lives in `redb`,
 a pure-Rust embedded store, so startup is O(1) and memory stays bounded
 however many Entries exist. An in-memory map would be simpler and was
 rejected because it grows without bound and is lost on every restart.
+The key is the pair (topic, Event ID) rather than the Event ID alone,
+because an Entry names no topic and the same line can be committed in two
+topics, which would otherwise collide.
 
 ## Decision 5: the HTTP surface, and the three encodings it fixes
 
@@ -142,26 +171,58 @@ proposed paper amendment, recorded as an ADR here.
 
 | Method and path | Body or query | Response |
 | --- | --- | --- |
-| `POST /topics` | topic settings | 201 |
-| `POST /topics/{t}/entries` | the line bytes; `Expected-Head` header | 201 receipt, or 409 refusal with the current head |
+| `POST /topics` | topic settings, operator token | 201 |
+| `POST /topics/{t}/entries` | one or more lines joined by `0x0a`, no terminator | 201 receipt, or 409 refusal with the current head |
 | `GET /topics/{t}/head` | | position and head hash |
 | `GET /topics/{t}/entries?after={event_id}` | | JSON Lines tail, exact bytes |
 | `GET /topics/{t}/aof` | | the whole file, exact bytes |
 | `GET /topics/{t}/lookup/{event_id}` | | position and the line |
 | `GET /topics/{t}/heartbeat/latest`, `/heartbeat`, `/heartbeat?from=&until=` | | as the specification appendix states |
 | `PUT`, `GET /topics/{t}/payloads/{ref}` | ciphertext | gated by the access policy |
-| `POST /topics/{t}/subscriptions` | a URL | 201; each commit is POSTed to it |
+| `POST /topics/{t}/subscriptions` | a URL, write token | 201; each commit's receipt is POSTed to it |
 
-**Submission.** The body is the line's exact bytes, without a terminator.
-The Hub adds the `0x0a`. The submission hash is SHA-256 of those bytes, which
-on acceptance is the Event ID. One hash, two roles.
+**Submission.** The body is the extension the Producer proposes: one or
+more lines, each the exact bytes of an Entry, joined by `0x0a` with no
+terminator after the last. A line is a JSON object and cannot contain a
+raw newline, so the separator is unambiguous, and a body that ends in
+`0x0a` is a batch whose last line is empty, which the acceptor refuses as
+malformed. The first line's `prev_hash` is the head the Producer signed
+against, and there is no separate statement of it: the acceptor's chain
+check on that line is the Hub's compare. Every later line is signed against
+the hash of the line before it in the body. The Hub appends the body and
+one `0x0a`, whole or not at all. A body of one line is the ordinary case
+and is not a special one.
+
+Batches exist because the eventchain repo measured the append rule's
+ceiling as one submission per race window, where the window is one
+signature plus the trip to the Hub, and then measured what a Producer gains
+by chaining several Entries before it submits
+(`docs/research/2026-10-producer-batching.md` there): across a 20 ms hop a
+batch of 100 commits 84 times what single lines do, and the ceiling is one
+signer's signature rate. The protocol already permits it, since a batch is
+ordinary Entries whose Producer knew their predecessors before the Hub did.
+What the Hub needs is to take a batch whole, and this is that.
+
+The submission hash is SHA-256 of the body. For a one-line body that is
+the line's bytes without a terminator, so the submission hash is the Event
+ID: one hash, two roles. For a batch it is the hash of the joined lines,
+which names the submission and nothing else. The Event IDs are the
+acceptor's line hashes, one per line, and the Producer holds them already:
+`produce` returns the line hash with the line.
 
 **Receipt and refusal.** The same shape as a heartbeat, so a verifier that
 checks one checks all three: a flat object of string members, `v` = `"1"`,
 `kind` = `"receipt"` or `"refusal"`, `topic_id`, `submission_hash`,
-`issued_at`, and `signature` over the JCS of the rest. A receipt adds
-`position`. A refusal adds `reason`, drawn from a closed vocabulary that is
-the verifier's fault names plus `head_mismatch`, and on `head_mismatch` the
+`issued_at`, and `signature` over the JCS of the rest. A receipt is a
+heartbeat over the state the submission produced, plus the submission hash:
+it adds `position` and `head_hash` after the append and `count`, the number
+of lines appended. The flat shape cannot carry a list of Event IDs; it does
+not need to, because `head_hash` is the last line's Event ID and binds every
+line before it, and the Producer computed the others when it signed. A
+refusal adds `reason`, drawn from a closed vocabulary that is the verifier's
+fault names plus `head_mismatch`, which is the verifier's chain mismatch on
+the first line, the case the paper's step 4 names; on a verifier fault it
+adds `line`, the ordinal of the refused line within the body, and on `head_mismatch` the
 current `position` and `head_hash` so the submitter can fetch the extension
 without a second round trip.
 
@@ -172,7 +233,27 @@ and the Hub does nothing to soften it.
 
 **Topic creation.** The binding between a topic and its first Entry is open
 in the paper and the Hub does not invent one. `POST /topics` records
-settings only.
+settings only. v1 encoding: the body is exactly a `topic.json`, every
+member required and no other allowed, and only the operator's bearer token,
+`HUB_ADMIN_TOKEN`, which the Hub refuses to start without, may create a
+topic; a topic whose directory exists is a 409. The topic does not exist
+before the request, so no topic policy can gate it, and the operator is the
+party who already decides which topics a Hub carries.
+
+**Payloads.** v1 encoding: a Payload is stored as exactly the bytes put,
+under a ref that is one safe file name, and is never replaced: a put of the
+same bytes to a taken ref is a 200, of other bytes a 409. The chain binds a
+`payload_ref` to one Payload through its hash, so a store that let a ref
+change would only ever serve bytes that fail that check.
+
+**Webhooks.** v1 encoding: what is POSTed to a subscriber is the receipt,
+the exact signed bytes the Producer got, and only for an accepted
+submission. A delivery is one attempt and four retries after waits of 1,
+4, 16 and 64 seconds in turn, each attempt given 10 seconds, a 2xx and
+nothing else counting as delivered. Deliveries are held in memory, so a restart drops the
+undelivered: the file is the record and a webhook only a prompt to read it,
+so a subscriber reconciles through `entries?after=` and a durable queue
+would add a second record of what the AOF already holds.
 
 ## Decision 6: the Hub key and the heartbeat list
 
@@ -184,8 +265,11 @@ reference says so.
 
 The heartbeat scheduler ticks per topic at the topic's interval, asks the
 writer thread for (count, head), signs the statement and appends it to
-`heartbeats.jsonl`. The Hub serves the list endpoints itself, and when a
-keeper URL is configured it also POSTs each heartbeat there. Serving the
+`heartbeats.jsonl`. The Hub serves the list endpoints itself, and it also
+POSTs each heartbeat to every URL in the topic's `heartbeat_hosts`, a list
+in the topic's settings rather than one keeper URL for the Hub, because the
+protocol has a topic trust several hosts and the topic's agreed settings
+decide which. Serving the
 list from the Hub is a documented weakening: it lets a single holder detect
 staleness, but a Hub that is its own keeper can show two holders two lists.
 The keeper role is the foundation's, and the reference Hub is built so the
@@ -198,6 +282,15 @@ The paper makes payload access application policy. The reference ships an
 to a role, where a role may read all of a topic's Payloads or none. That is
 enough to show the Hub enforcing policy without decryption keys and not
 enough to be mistaken for an authorisation system.
+
+v1 encoding: the tokens are the `access` member of `topic.json`, each with
+the role `read`, which may get every Payload of the topic, or `write`, which
+may also put Payloads and subscribe to the topic. Putting needs a role
+beyond reading because a Hub that took any bytes from anyone would let a
+stranger occupy a ref; subscribing rides on `write` rather than a third
+role because a subscriber is a party the topic already trusts with its
+Payloads. No token or an unknown one is a 401, a token without the role a
+403, and tokens are compared in constant time.
 
 ## What is out of scope and why
 
@@ -218,11 +311,15 @@ src/
   main.rs      configuration and wiring only
   acceptor/    safe Rust wrapper over the C ABI, runtime lifecycle
   topic/       the writer thread: compare, accept, append, fsync, recover
-  store/       AOF file, head sidecar, heartbeat file, payload blobs, index
+  store/       AOF file, head sidecar, heartbeat file, payload blobs
+  index/       the Event ID index; its own concept, not a file of the store, because it is derived from the AOF and rebuilt from it
   api/         routes, one file per resource
   heartbeat/   scheduler and publisher
+  access/      the AccessPolicy trait, its token implementation and the operator token; its own concept because routes ask it and never read a credential
   signer/      the trait and the Haskell-backed implementation
   webhook/     subscriptions and delivery with retry
+tools/
+  producer/    the end-to-end run: not part of the Hub, the client that grades it
 docs/
   plan.md      this document
   adr/         one record per fixed encoding and per boundary decision
@@ -233,17 +330,23 @@ Each directory is one concept. No file in `src/` carries two of them.
 ## Tests
 
 Under this repo's rules, tests exist only where a pure function branches and
-a bug would be silent. Two places qualify:
+a bug would be silent. These places qualify:
 
 - The acceptor's conformance test: every committed eventchain vector pushed
   through the C ABI one line at a time, asserting the verdict the verifier
   gives. Bytes in, enum out, no mock.
 - Crash recovery: the reconciliation rule over (sidecar, file length,
-  trailing line) is a pure decision with four outcomes.
+  trailing lines) is a pure decision with four outcomes.
+- The file-name rule for topic ids and payload refs, added with topic
+  creation and payloads, because a request now names a path and a wrong
+  answer is a traversal nobody sees.
 
 Everything else is exercised by running the Hub against a Producer and
 verifying the resulting file with the verifier, which is what the file is
-for.
+for. That run is `tools/producer/`: a Producer on the upstream eventchain
+libraries at the acceptor's pinned commit, and a driver that mints, puts
+payloads, submits from the live head, refuses a stale head and an altered
+line, fetches and verifies the served file, and restarts.
 
 ## Build
 
@@ -257,8 +360,8 @@ v1 requirement.
 1. **Acceptor.** The Haskell package, the ABI, the conformance test. Done
    when every vector gives the verifier's verdict through the C ABI.
 2. **Append.** Writer thread, durability rule, recovery, receipt and
-   refusal. Done when a Producer can append through HTTP and the verifier
-   accepts the file.
+   refusal. Done when a Producer can append one line and a batch through
+   HTTP and the verifier accepts the file.
 3. **Distribute and heartbeat.** Head, extension, whole file, lookup,
    scheduler, list endpoints.
 4. **Payloads and webhooks.** Blob store behind the policy trait,
