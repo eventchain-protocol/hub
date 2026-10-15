@@ -213,6 +213,7 @@ acceptor/      Haskell Cabal project over the eventchain libraries
   src/         the acceptor: one line judged by the verifier, verdicts coded for the ABI
   ffi/         the C-ABI shared library's exports; marshalling only
   include/     the C header; the ABI contract between the two languages
+  cbits/       the C shim that starts and stops the GHC runtime for the Rust side
   tests/       the conformance test: every eventchain vector through the C ABI
 src/
   main.rs      configuration and wiring
