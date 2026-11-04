@@ -9,9 +9,12 @@ already-signed Entries and appends them to per-topic append-only JSON Lines
 files.
 
 > [!WARNING]
-> **Work in progress.** This crate is an early spike, not a usable Hub. It does
-> not implement the protocol, its interfaces will change without notice, and it
-> must not be used to hold real data.
+> **Work in progress.** Milestones 1–4 below implement this crate's planned Hub
+> duties. The repository does not contain the separate heartbeat-host service
+> or the optional OpenTimestamps service. The Hub has not been production-hardened
+> and has no automated integration suite;
+> `tools/producer/run.sh` is its end-to-end check. Its interfaces will change
+> without notice, and it must not be used to hold real data.
 
 ## Status
 
@@ -82,8 +85,8 @@ altered after signing, fetches the whole file, the extension and a lookup,
 verifies the served file with the upstream verifier, checks every payload
 against its entry's `payload_hash`, checks a heartbeat, restarts the Hub and
 submits again. Every check prints `PASS` or `FAIL` and the exit status is
-the count of failures. This run stands in for the tests the Hub does not
-write.
+the count of failures. This run stands in for the integration tests the Hub does
+not have.
 
 ```sh
 (cd tools/producer && cabal build)
