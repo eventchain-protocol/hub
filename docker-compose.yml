@@ -1,0 +1,41 @@
+services:
+  hub:
+    image: eventchain-hub
+    build:
+      context: .
+      target: hub
+    ports:
+      - "127.0.0.1:3717:3717"
+    environment:
+      HUB_KEY: ${HUB_KEY:?set HUB_KEY to 64 hex characters, for example in .env}
+      HUB_ADMIN_TOKEN: ${HUB_ADMIN_TOKEN:?set HUB_ADMIN_TOKEN, for example in .env}
+      HUB_DATA: /data
+      HUB_ADDR: 0.0.0.0:3717
+    volumes:
+      - hub-data:/data
+    healthcheck:
+      # Any HTTP answer, a 404 for an unknown topic included, shows the Hub is listening.
+      test: ["CMD", "curl", "-s", "-o", "/dev/null", "http://127.0.0.1:3717/topics/health/head"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # The demo's Producer and checkers; run by demo/run.sh, never started by `up`.
+  tools:
+    image: eventchain-hub-tools
+    build:
+      context: .
+      target: tools
+    profiles: ["tools"]
+
+  # The independent TypeScript verifier, built from its own repository at a
+  # pinned commit. It runs without a network: verification is offline.
+  verify-ts:
+    image: eventchain-verify-ts
+    build:
+      context: https://github.com/eventchain-protocol/verify.git#810ef562fdedde5897ae2480a3c1495c6b3b58f7
+    profiles: ["tools"]
+    network_mode: none
+
+volumes:
+  hub-data:
