@@ -32,7 +32,9 @@ The Hub does not re-implement the per-line checks. It calls
 duplicate-member and surrogate rules, JCS, continuity, attribution and the
 Mint envelope checks. "The Hub applies exactly the checks a verifier applies
 to one line" becomes literally true, and the committed vectors in the
-eventchain repo are the acceptor's conformance suite.
+eventchain repo are the acceptor's conformance suite. (They have since moved
+to the conformance repository, which eventchain mounts as a submodule; the
+acceptor reads them from there in the pinned checkout.)
 
 The Hub itself is written in Rust. The seam between them is a shared
 library with a C ABI, built from a Cabal `foreign-library` stanza. Nothing

@@ -87,6 +87,10 @@ enum ec_fault {
     EC_FAULT_NOT_BASE64URL = 112,
     EC_FAULT_MEMBER_WRONG_SHAPE = 113,
     EC_FAULT_FILE_HAS_BOM = 114,
+    /* 115: ec_accept supplies the terminator itself, so it never reports this;
+     * it is numbered because the Verifier can report it. */
+    EC_FAULT_LINE_UNTERMINATED = 115,
+    EC_FAULT_LINE_HAS_CARRIAGE_RETURN = 116,
 
     /* EC_UNDECIDED: eventchain-crypto's CryptoError. */
     EC_FAULT_CRYPTO_KEY_NOT_ON_CURVE = 200,

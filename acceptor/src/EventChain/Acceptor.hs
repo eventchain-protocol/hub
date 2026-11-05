@@ -125,6 +125,8 @@ lineErrorCode = \case
     UnknownKind _ -> 111
     NotBase64Url _ _ -> 112
     MemberWrongShape _ _ -> 113
+    LineUnterminated -> 115
+    LineHasCarriageReturn -> 116
 
 -- | Why libcrypto gave no answer. Not a fault in the line.
 cryptoErrorCode :: CryptoError -> Int32

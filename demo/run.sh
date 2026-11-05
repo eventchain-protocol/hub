@@ -36,8 +36,14 @@ set -a; . ./.env; set +a
 [ -n "${HUB_ADMIN_TOKEN:-}" ] || die ".env has no HUB_ADMIN_TOKEN"
 mkdir -p "$OUT"
 
+# Every image is built here, before any output is captured. `docker compose
+# run` would otherwise build a missing image on first use and print the build
+# log to stdout, into the file the next check reads.
+echo "== build the images"
+docker compose --profile tools build
+
 echo "== start the Hub"
-docker compose up -d --build --wait hub
+docker compose up -d --wait hub
 HUB_KEY_PUB=$(docker compose logs --no-log-prefix hub | sed -n 's/^hub key \([A-Za-z0-9_-]*\)$/\1/p' | tail -n 1)
 [ -n "$HUB_KEY_PUB" ] || die "the Hub's log has no 'hub key' line"
 printf '%s\n' "$HUB_KEY_PUB" > "$OUT/hub-key.txt"
