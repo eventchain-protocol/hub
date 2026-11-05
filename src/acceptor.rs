@@ -200,6 +200,8 @@ faults! {
     NotBase64Url = 112 => "not_base64url",
     MemberWrongShape = 113 => "member_wrong_shape",
     FileHasBom = 114 => "file_has_bom",
+    LineUnterminated = 115 => "line_unterminated",
+    LineHasCarriageReturn = 116 => "line_has_carriage_return",
     CryptoKeyNotOnCurve = 200 => "crypto_key_not_on_curve",
     CryptoScalarWrongLength = 201 => "crypto_scalar_wrong_length",
     CryptoScalarRejected = 202 => "crypto_scalar_rejected",

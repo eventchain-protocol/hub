@@ -112,15 +112,18 @@ splitLines file = case BS.split 0x0a file of
     pieces | not (null pieces) && BS.null (last pieces) -> init pieces
     pieces -> pieces
 
--- | The vectors inside the eventchain checkout cabal made for the pinned commit.
+{- | The vectors inside the eventchain checkout cabal made for the pinned
+commit. They live in the conformance repository, which eventchain mounts as
+its @conformance@ submodule; cabal checks submodules out with the commit.
+-}
 vectorsDir :: IO FilePath
 vectorsDir = do
     let root = "dist-newstyle" </> "src"
     entries <- listDirectory root
-    found <- filterM doesDirectoryExist [root </> e </> "vectors" | e <- entries, "eventchain-" `isPrefixOf` e]
+    found <- filterM doesDirectoryExist [root </> e </> "conformance" </> "vectors" | e <- entries, "eventchain-" `isPrefixOf` e]
     case found of
         [one] -> pure one
-        [] -> failWith ("no eventchain checkout with a vectors/ directory under " <> root)
+        [] -> failWith ("no eventchain checkout with a conformance/vectors/ directory under " <> root <> "; the conformance submodule is missing")
         many -> failWith ("more than one eventchain checkout under " <> root <> ": " <> show many)
 
 -- | Every .jsonl file below the directory, in a fixed order.

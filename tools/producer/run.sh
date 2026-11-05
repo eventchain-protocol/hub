@@ -89,6 +89,16 @@ check "reason signature_invalid" "$(field $OUT/r4.refusal reason)" "signature_in
 check "line 1" "$(field $OUT/r4.refusal line)" "1"
 check "nothing appended" "$(head_hash)" "$H6"
 
+echo "== round 4b: a batch written with CRLF line endings"
+mint 7 2 $H6 $OUT/r4b
+python3 -I -c '
+import sys
+p=sys.argv[1]; b=open(p,"rb").read(); open(p,"wb").write(b.replace(b"\n",b"\r\n"))' $OUT/r4b/lines.jsonl
+check "submit 409" "$(submit $OUT/r4b $OUT/r4b.refusal)" "409"
+check "reason line_has_carriage_return" "$(field $OUT/r4b.refusal reason)" "line_has_carriage_return"
+check "line 0" "$(field $OUT/r4b.refusal line)" "0"
+check "nothing appended" "$(head_hash)" "$H6"
+
 echo "== round 5: ten more, one submission"
 mint 7 10 $H6 $OUT/r5
 check "payloads put" "$(put_payloads $OUT/r5)" "10"

@@ -100,7 +100,10 @@ cargo build --release
 ```
 
 The acceptor's conformance test reads the vectors from the eventchain
-checkout cabal makes under `acceptor/dist-newstyle/src/`:
+checkout cabal makes under `acceptor/dist-newstyle/src/`. They live in the
+[conformance](https://github.com/eventchain-protocol/conformance) repository,
+which eventchain mounts as its `conformance` submodule, and cabal checks the
+submodule out with the pinned commit:
 
 ```sh
 (cd acceptor && cabal test)
