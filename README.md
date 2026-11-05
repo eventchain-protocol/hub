@@ -44,7 +44,39 @@ The operator creates topics over HTTP with an admin token.
 The design, its decisions and the milestone definitions are in
 [`docs/plan.md`](docs/plan.md).
 
+## Run it in Docker
+
+With Docker and curl, and no other toolchain:
+
+```sh
+git clone https://github.com/eventchain-protocol/hub && cd hub
+./demo/run.sh
+```
+
+The script builds the images, starts a Hub on `127.0.0.1:3717` and creates a
+topic. It then signs nine entries with the Producer in three rounds, submits
+them, and fetches the file and a heartbeat into `demo/out/`. Two verifiers
+check what it fetched: this repository's Haskell one, and the independent
+[TypeScript verifier](https://github.com/eventchain-protocol/verify), which is
+built from its own repository at a pinned commit and runs with no network.
+Every check prints `PASS` or `FAIL`, and the script exits non-zero if any
+fails. The first run compiles GHC and Rust code and takes a while; later
+runs reuse the images.
+
+The first run writes a random `HUB_KEY` and `HUB_ADMIN_TOKEN` to `.env`. To
+run the demo again from scratch, delete the Hub's data volume and the
+outputs:
+
+```sh
+docker compose down -v && rm -rf demo/out
+```
+
+`docker compose up -d hub` starts the Hub alone, with the same settings, for
+use with the [routes below](#usage).
+
 ## Requirements
+
+To build without Docker:
 
 | Dependency | Version | Needed for |
 | --- | --- | --- |
@@ -232,6 +264,8 @@ src/
   api.rs       the head and submission routes; topics.rs creation, distribute.rs the extension, file and lookup,
                heartbeat.rs the list, payloads.rs the blobs, subscriptions.rs subscribing
 build.rs       links the acceptor library built by cabal
+Dockerfile     the Hub image and the tools image the demo runs; docker-compose.yml wires them with the TypeScript verifier
+demo/          run.sh, the Docker demo; its outputs land in demo/out/
 tools/
   producer/    the end-to-end run: a Producer on the upstream libraries, its driver, and the statement signature check
 docs/
