@@ -1,3 +1,5 @@
 /target
 /acceptor/dist-newstyle
 /tools/producer/dist-newstyle
+/.env
+/demo/out

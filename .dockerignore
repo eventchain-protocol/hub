@@ -1,0 +1,6 @@
+.git
+target/
+**/dist-newstyle/
+data/
+demo/out/
+.env
